@@ -1,0 +1,9 @@
+flask
+requests
+pandas
+numpy
+earthengine-api
+python-dotenv
+flask-cors
+google-genai
+firebase-admin
