@@ -382,6 +382,7 @@ AIRNOW_API_KEY="your_airnow_key"
 
 # AI Integration
 GEMINI_API_KEY="your_gemini_key"
+GROQ_API_KEY="your_groq_key"
 
 # Alert System
 ALERTS_API_KEY="your_alerts_key"

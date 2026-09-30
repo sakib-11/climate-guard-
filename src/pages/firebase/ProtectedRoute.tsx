@@ -20,9 +20,16 @@ const ProtectedRoute: React.FC = () => {
     return () => unsubscribe();
   }, []);
 
-  // Show nothing (or a spinner) while checking the Firebase status
+  // Show clean spinner while checking the Firebase status
   if (isAuthenticated === null) {
-    return <div>Loading authentication status...</div>; 
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-background">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-8 h-8 border-4 border-primary border-t-transparent rounded-full animate-spin" />
+          <p className="text-sm text-muted-foreground font-medium">Authenticating ClimateGuard...</p>
+        </div>
+      </div>
+    );
   }
 
   // If authenticated, render the nested route (<Outlet />)

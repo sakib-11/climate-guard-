@@ -1,8 +1,7 @@
 // C:\Users\DELL\Desktop\ClimateGuard\src\App.tsx
 
 import { Toaster } from "@/components/ui/toaster";
-// Temporarily remove Sonner to avoid runtime errors during theme access
-// import { Toaster as Sonner } from "@/components/ui/sonner";
+import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import ErrorBoundary from "@/components/ErrorBoundary";
@@ -42,7 +41,7 @@ const App: React.FC = () => (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
         <Toaster />
-        {/* <Sonner /> temporarily disabled to avoid theme-related runtime errors */}
+        <Sonner />
         <BrowserRouter>
           <Routes>
           {/* 🔑 Public Route: Login/Signup */}

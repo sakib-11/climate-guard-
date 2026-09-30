@@ -24,6 +24,18 @@ def start_service(name, path, port):
     )
     return process
 
+import threading
+
+def stream_output(proc, name):
+    try:
+        for line in iter(proc.stdout.readline, ''):
+            if line:
+                print(f"[{name}] {line.strip()}", flush=True)
+            else:
+                break
+    except Exception:
+        pass
+
 def main():
     # Root directory of the project
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -44,10 +56,16 @@ def main():
     # Give it a second to initialize
     time.sleep(2)
     
-    # Start Gemini Aggregator (Port 5010)
-    gemini_proc = start_service("Gemini Aggregator", gemini_path, 5010)
+    # Start AI Aggregator (Port 5010)
+    gemini_proc = start_service("AI Aggregator (Gemini / Groq)", gemini_path, 5010)
 
-    print("\n[SUCCESS] Both services are starting. Press Ctrl+C to stop both.\n")
+    # Start non-blocking log streamers
+    t1 = threading.Thread(target=stream_output, args=(api_proc, "API"), daemon=True)
+    t2 = threading.Thread(target=stream_output, args=(gemini_proc, "AI"), daemon=True)
+    t1.start()
+    t2.start()
+
+    print("\n[SUCCESS] Both services are running. Press Ctrl+C to stop both.\n")
 
     try:
         while True:
@@ -56,16 +74,9 @@ def main():
                 print("[ERROR] Climate API stopped unexpectedly.")
                 break
             if gemini_proc.poll() is not None:
-                print("[ERROR] Gemini Aggregator stopped unexpectedly.")
+                print("[ERROR] AI Aggregator stopped unexpectedly.")
                 break
-            
-            # Print any output from the processes
-            for proc, name in [(api_proc, "API"), (gemini_proc, "GEMINI")]:
-                line = proc.stdout.readline()
-                if line:
-                    print(f"[{name}] {line.strip()}")
-            
-            time.sleep(0.1)
+            time.sleep(0.5)
     except KeyboardInterrupt:
         print("\n[STOPPING] Stopping services...")
         api_proc.terminate()

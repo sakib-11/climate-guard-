@@ -7,3 +7,4 @@ python-dotenv
 flask-cors
 google-genai
 firebase-admin
+groq

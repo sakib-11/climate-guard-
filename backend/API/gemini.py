@@ -17,6 +17,11 @@ from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
+
 import firebase_admin
 from firebase_admin import credentials, firestore
 from google.cloud.firestore_v1.base_client import BaseClient as FirestoreClient # For type hinting
@@ -42,16 +47,24 @@ PREP_ENDPOINT = f"{LOCAL_BASE}/api/preparedness"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # primary key
 GEMINI_API_KEY_FALLBACK = os.getenv("GEMINI_API_KEY_FALLBACK")  # optional fallback key
 # Primary model with ordered fallback list
-GEMINI_MODEL_PRIMARY = "gemini-2.0-flash"
-GEMINI_MODEL_FALLBACK = "gemini-2.0-flash-lite"
+GEMINI_MODEL_PRIMARY = "gemini-2.5-flash"
+GEMINI_MODEL_FALLBACK = "gemini-2.5-flash-lite"
 GEMINI_MODEL = GEMINI_MODEL_PRIMARY  # active model (may switch at runtime)
-# All models to try in order (most capable → lightest)
+# All models to try in order (supported available models)
 GEMINI_MODELS_PRIORITY = [
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash",
+    "gemini-3.6-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-flash-latest",
+]
+
+# Groq API Configuration
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODELS_PRIORITY = [
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.8-27b",
+    "openai/gpt-oss-20b",
+    "allam-2-7b",
 ]
 
 # Initialize the Gemini Client globally
@@ -60,17 +73,31 @@ GEMINI_API_KEYS = [
     if api_key
 ]
 GEMINI_CLIENTS = []
+GEMINI_CLIENT = None
 
 try:
     if GEMINI_API_KEYS:
         GEMINI_CLIENTS = [genai.Client(api_key=api_key) for api_key in GEMINI_API_KEYS]
         GEMINI_CLIENT = GEMINI_CLIENTS[0]
+        print("[SUCCESS] Gemini Client Initialized.")
     else:
-        raise ValueError("GEMINI_API_KEY is not set.")
+        print("[INFO] GEMINI_API_KEY not set. Gemini features disabled.")
 except Exception as e:
     print(f"[ERROR] Failed to initialize Gemini Client: {e}")
     GEMINI_CLIENTS = []
     GEMINI_CLIENT = None
+
+# Initialize the Groq Client globally
+GROQ_CLIENT = None
+if GROQ_API_KEY and Groq:
+    try:
+        GROQ_CLIENT = Groq(api_key=GROQ_API_KEY)
+        print("[SUCCESS] Groq Client Initialized.")
+    except Exception as e:
+        print(f"[ERROR] Failed to initialize Groq Client: {e}")
+        GROQ_CLIENT = None
+elif not GROQ_API_KEY:
+    print("[INFO] GROQ_API_KEY not set. Groq fallback disabled.")
 
 # HTTP timeout (seconds)
 
@@ -112,9 +139,10 @@ def log_gemini_query(
     gemini_prompt: str,
     gemini_response: dict | None,
     success: bool,
-    error_message: str = None
+    error_message: str = None,
+    model_name: str = None
 ):
-    """Logs the Gemini query and response to the 'gemini_logs' collection in Firestore."""
+    """Logs the AI query and response to the 'gemini_logs' collection in Firestore."""
     global DB_CLIENT
     if DB_CLIENT is None:
         return
@@ -122,7 +150,7 @@ def log_gemini_query(
     log_entry = {
         "timestamp": datetime.now(),
         "query_city": query_city,
-        "gemini_model": GEMINI_MODEL,
+        "gemini_model": model_name or GEMINI_MODEL,
         "success": success,
         "prompt": gemini_prompt,
         "response_data": gemini_response, 
@@ -230,9 +258,29 @@ def _attempt_gemini(client, model: str, instruction: str, config) -> dict:
     return json.loads(response.text)
 
 
-def call_gemini(city: str, lat: str = None, lon: str = None, missing_fields: List[str] = None) -> dict:
-    if GEMINI_CLIENT is None or not GEMINI_CLIENTS:
-        raise RuntimeError("Gemini Client failed to initialize.")
+def _attempt_groq(client, model: str, instruction: str) -> dict:
+    """Single attempt against Groq client and model. Raises on failure."""
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an AI environmental analyst generating structured JSON data for a Climate Risk Dashboard. "
+                    "Output ONLY a valid JSON object matching the exact schema requested by the user."
+                ),
+            },
+            {"role": "user", "content": instruction},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.2,
+    )
+    return json.loads(response.choices[0].message.content)
+
+
+def call_ai(city: str, lat: str = None, lon: str = None, missing_fields: List[str] = None) -> dict:
+    if GEMINI_CLIENT is None and GROQ_CLIENT is None:
+        raise RuntimeError("Neither Gemini nor Groq Client is configured. Set GEMINI_API_KEY or GROQ_API_KEY in .env.")
 
     # We use the requested city, lat, and lon in the prompt
     now = datetime.utcnow().strftime("%Y-%m-%d")
@@ -274,76 +322,85 @@ def call_gemini(city: str, lat: str = None, lon: str = None, missing_fields: Lis
         response_schema=OUTPUT_SCHEMA
     )
 
-    # ── Initialise tracking variables BEFORE the try block so `finally` never
-    #    hits a NameError regardless of where an exception is raised. ──────────
-    gemini_result = None
-    error_str     = None
-    success       = False
-    used_model    = GEMINI_MODEL_PRIMARY
-    used_key_slot = 1
+    ai_result  = None
+    error_str  = None
+    success    = False
+    used_model = "none"
 
-    try:
-        # Try each model in priority order, each with exponential-backoff
-        # retries to handle transient rate-limit / timeout / quota errors.
+    # 1. Try Gemini first if client is available
+    if GEMINI_CLIENT is not None:
         last_exc = None
-
         for model in GEMINI_MODELS_PRIORITY:
-            used_model = model
+            used_model = f"gemini:{model}"
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
-                    print(f"[GEMINI] Calling {model} (attempt {attempt}/{MAX_RETRIES})...")
-                    gemini_result = _attempt_gemini(GEMINI_CLIENT, model, instruction, config)
+                    print(f"[AI] Calling Gemini {model} (attempt {attempt}/{MAX_RETRIES})...")
+                    ai_result = _attempt_gemini(GEMINI_CLIENT, model, instruction, config)
                     success = True
                     last_exc = None
-                    break   # success — stop retrying this model
-
+                    break
                 except Exception as exc:
                     last_exc = exc
                     err_msg = str(exc).lower()
-                    # On quota exhaustion, skip immediately to next model (don't retry)
-                    is_quota = any(kw in err_msg for kw in [
-                        "quota", "resource_exhausted", "429"
-                    ])
-                    is_transient = any(kw in err_msg for kw in [
-                        "503", "500", "timeout", "deadline", "unavailable"
-                    ])
+                    is_quota = any(kw in err_msg for kw in ["quota", "resource_exhausted", "429"])
+                    is_transient = any(kw in err_msg for kw in ["503", "500", "timeout", "deadline", "unavailable"])
                     if is_quota:
-                        print(f"[GEMINI] Quota exceeded on {model}, trying next model...")
-                        break  # skip to next model immediately
+                        print(f"[AI] Quota exceeded on Gemini {model}, trying next model...")
+                        break
                     elif is_transient and attempt < MAX_RETRIES:
                         delay = RETRY_DELAY_BASE ** attempt
-                        print(f"[GEMINI] Transient error on {model}, retrying in {delay}s: {exc}")
+                        print(f"[AI] Transient error on Gemini {model}, retrying in {delay}s: {exc}")
                         time.sleep(delay)
                     else:
-                        print(f"[GEMINI] Non-retryable / max retries reached on {model}: {exc}")
-                        break   # move on to next model
-
+                        print(f"[AI] Gemini {model} failed: {exc}")
+                        break
             if success:
-                break   # don't try next model if current succeeded
+                break
+        if not success and last_exc:
+            error_str = f"Gemini failed: {last_exc}"
 
-        if not success:
-            error_str = str(last_exc) if last_exc else "Unknown Gemini error"
+    # 2. Fall back to Groq if Gemini failed or wasn't configured
+    if not success and GROQ_CLIENT is not None:
+        print("[AI] Falling back to Groq provider...")
+        last_groq_exc = None
+        for model in GROQ_MODELS_PRIORITY:
+            used_model = f"groq:{model}"
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    print(f"[AI] Calling Groq {model} (attempt {attempt}/{MAX_RETRIES})...")
+                    ai_result = _attempt_groq(GROQ_CLIENT, model, instruction)
+                    if isinstance(ai_result, dict):
+                        success = True
+                        last_groq_exc = None
+                        break
+                except Exception as exc:
+                    last_groq_exc = exc
+                    print(f"[AI] Groq {model} error (attempt {attempt}/{MAX_RETRIES}): {exc}")
+                    if attempt < MAX_RETRIES:
+                        time.sleep(RETRY_DELAY_BASE ** attempt)
+            if success:
+                break
+        if not success and last_groq_exc:
+            error_str = f"Gemini & Groq failed. Last error: {last_groq_exc}"
 
-    except Exception as outer_exc:
-        # Catch anything unexpected in the loop logic itself
-        error_str = str(outer_exc)
-        success   = False
+    # Firestore logging
+    log_gemini_query(
+        query_city=city,
+        gemini_prompt=instruction,
+        gemini_response=ai_result,
+        success=success,
+        error_message=error_str,
+        model_name=used_model
+    )
 
-    finally:
-        # 🔥 INTEGRATION POINT: Log the attempt regardless of success/failure
-        log_gemini_query(
-            query_city=city,
-            gemini_prompt=instruction,
-            gemini_response=gemini_result,
-            success=success,
-            error_message=error_str
-        )
+    if not success or ai_result is None:
+        raise RuntimeError(f"AI API Failure ({used_model}): {error_str}")
 
-        # If there was an error, raise it now to stop processing the request
-    if error_str:
-        raise RuntimeError(f"Gemini API SDK Failure ({used_model}): {error_str}")
+    return ai_result
 
-    return gemini_result
+
+# Maintain backward compatibility
+call_gemini = call_ai
 
 def merge_sources(primary: dict, fallback: dict) -> dict:
     if primary is None:

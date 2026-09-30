@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "node scripts/vite-runner.mjs dev",
+    "backend": "./run_backend.sh",
     "build": "node scripts/vite-runner.mjs build",
     "build:dev": "node scripts/vite-runner.mjs build development",
     "lint": "eslint .",
